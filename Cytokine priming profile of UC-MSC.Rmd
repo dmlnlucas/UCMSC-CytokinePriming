@@ -1,0 +1,903 @@
+---
+title: "250728 PrimedMSC mix"
+author: "Lucas Dumoulin"
+date: "2025-07-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(limma)
+library(edgeR)
+library(tibble)
+library(dplyr)
+library(ggplot2)
+library(viridis)
+library(pheatmap)
+library(RColorBrewer)
+library(ggrepel)
+library(ggVennDiagram)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(fgsea)
+library(msigdbr)
+library(ComplexHeatmap)
+if (!requireNamespace("hgu133plus2.db", quietly = TRUE)) {
+  BiocManager::install("hgu133plus2.db")
+}
+
+library(hgu133plus2.db)
+library(AnnotationDbi)
+```
+
+## Import and annotate dataset from mixed cytokine primed samples (GSE224190)
+```{r}
+# Import results dataset
+results_file <- file.choose() # GSE224190_gene_FPKM
+df <- read.delim(results_file)
+
+# Prepare expression matrix
+expr <- as.matrix(df[, c(
+  "ctrl.1_fpkm",
+  "ctrl.2_fpkm",
+  "ctrl.3_fpkm",
+  "primed.1_fpkm",
+  "primed.2_fpkm",
+  "primed.3_fpkm"
+)])
+rownames(expr) <- df$id
+
+# Log2 transform to stabilize variance
+log2expr <- log2(expr + 1)
+
+# Set up design matrix
+group <- factor(c(rep("Control", 3), rep("Primed", 3)))
+design <- model.matrix(~0 + group)
+colnames(design) <- levels(group)
+
+# Fit linear model
+fit <- lmFit(log2expr, design)
+cont.matrix <- makeContrasts(Primed_vs_Control = Primed - Control, levels = design)
+fit2 <- contrasts.fit(fit, cont.matrix)
+fit2 <- eBayes(fit2, trend = TRUE)
+
+# Extract results with FDR correction
+res <- topTable(fit2, coef = "Primed_vs_Control", number = Inf, adjust.method = "BH")
+res$Symbol <- rownames(res)
+res$negLogP <- -log10(res$P.Value)
+
+# Define significance thresholds
+sig.logFC <- 1
+sig.P.Value <- 0.05
+
+res$Significant <- ifelse(res$adj.P.Val < sig.P.Value & abs(res$logFC) > sig.logFC, "Significant", "Not Significant")
+
+# Import annotation file
+names(res)[names(res) == "Symbol"] <- "EnsemblGeneID"
+Human.GRCh38.p13.annot.tsv <- read.delim("G:/.shortcut-targets-by-id/1zOmt4AIZS3E83t7j4JmomdNejC7JYakS/Lucas-research data/01 DATA/Bioinformatics/Human.GRCh38.p13.annot.tsv.gz")
+Human.GRCh38.p13.annot.tsv$GeneID <- as.character(Human.GRCh38.p13.annot.tsv$GeneID)
+
+# Merge results with annotations
+primedMSC <- merge(res, Human.GRCh38.p13.annot.tsv, by.x='EnsemblGeneID', by.y='EnsemblGeneID', all.x=TRUE)
+```
+
+## Quality control: PCA
+```{r}
+# Use original dataset for PCA
+results <- df  
+
+# Select FPKM columns and prepare matrix
+fpkm_matrix <- results %>%
+  dplyr::select(contains("fpkm")) %>%
+  as.matrix()
+
+rownames(fpkm_matrix) <- results$id
+
+# Log-transform and filter zero variance genes
+log_fpkm <- log2(fpkm_matrix + 1)
+log_fpkm <- log_fpkm[apply(log_fpkm, 1, var) != 0, ]
+
+# Perform PCA
+pca <- prcomp(t(log_fpkm), scale. = TRUE)
+
+# Create plotting dataframe
+pca_df <- as.data.frame(pca$x)
+pca_df$Sample <- rownames(pca_df)
+pca_df$Condition <- ifelse(grepl("ctrl", pca_df$Sample), "Control", "Primed")
+pca_df$Condition <- factor(pca_df$Condition, levels = c("Control", "Primed"))
+pca_df$SampleLabel <- pca_df$Sample %>%
+ gsub("ctrl\\.(\\d+)_fpkm", "Control \\1", .) %>%
+ gsub("primed\\.(\\d+)_fpkm", "Primed \\1", .)
+
+# Plot PCA
+percentVar <- round(100 * (pca$sdev^2 / sum(pca$sdev^2)), 1)
+
+ggplot(pca_df, aes(x = PC1, y = PC2, color = Condition)) +
+  geom_point(size = 4) +
+  geom_text_repel(aes(label = SampleLabel), size = 5, max.overlaps = 100, box.padding = 0.5) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  scale_color_manual(values = c("Control" = "#2E86AB", "Primed" = "#A23B72")) +
+  theme_minimal(base_size = 16) +
+  theme(
+    axis.line = element_line(size = 1.2, colour = "black"),
+    axis.ticks = element_line(size = 1),
+    panel.grid = element_blank(),
+    legend.title = element_blank(),
+    plot.title = element_text(hjust = 0.5)
+  ) +
+  ggtitle("PCA Plot of log2(FPKM + 1) Data")
+```
+
+## Data exploration 
+```{r}
+# Add regulation column
+primedMSC$Regulation <- ifelse(primedMSC$logFC > 0, "Upregulated", "Downregulated")
+
+# Volcano plot function
+generate_volcano_plot <- function(data, title) {
+  ggplot(data, aes(x = logFC, y = -log10(P.Value), color = Significant)) +
+    geom_point(alpha = 0.6) +
+    scale_color_manual(values = c("Not Significant" = "grey", "Significant" = "red")) +
+    theme_minimal() +
+    xlab("Log2 Fold Change") +
+    ylab("-Log10 P-value") +
+    ggtitle(title) +
+    geom_vline(xintercept = c(-sig.logFC, sig.logFC), linetype = "dashed", color = "blue") +
+    geom_hline(yintercept = -log10(sig.P.Value), linetype = "dashed", color = "blue") +
+    geom_text_repel(
+      data = data %>% filter(Significant == "Significant"),
+      aes(label = Symbol),
+      size = 4,
+      max.overlaps = 10
+    )
+}
+
+# Generate main volcano plot
+generate_volcano_plot(primedMSC, "Volcano plot of unprimed vs primed MSCs")
+
+# Export significant genes
+significant_genes <- primedMSC %>%
+  filter(Significant == "Significant", !is.na(Symbol), Symbol != "") %>%
+  pull(Symbol) %>%
+  unique()
+
+write.table(significant_genes, file = "significant_genes.txt", 
+            quote = FALSE, row.names = FALSE, col.names = FALSE)
+
+# Create heatmap of top significant genes
+top_significant_genes <- primedMSC %>%
+  filter(Significant == "Significant", !is.na(Symbol), !is.na(logFC)) %>%
+  arrange(desc(abs(logFC))) %>%
+  slice_head(n = 25)  # Top 25 most differentially expressed
+
+# Prepare expression data for heatmap
+sig_genes_symbols <- top_significant_genes$Symbol
+sig_expr <- log2expr[rownames(log2expr) %in% top_significant_genes$EnsemblGeneID, ]
+
+# Add gene symbols as rownames if available
+gene_mapping <- setNames(top_significant_genes$Symbol, top_significant_genes$EnsemblGeneID)
+rownames(sig_expr) <- gene_mapping[rownames(sig_expr)]
+
+# Create annotation for samples
+annotation_col <- data.frame(
+  Condition = c(rep("Control", 3), rep("Primed", 3))
+)
+rownames(annotation_col) <- colnames(sig_expr)
+
+# Define consistent colors for conditions
+ann_colors <- list(
+  Condition = c("Control" = "#2E86AB", "Primed" = "#A23B72")
+)
+
+# Generate heatmap
+if(nrow(sig_expr) > 1) {
+  pdf("Top25_DEGs_heatmap.pdf", width = 8, height = 10)
+  pheatmap(
+    sig_expr,
+    scale = "row",
+    annotation_col = annotation_col,
+    annotation_colors = ann_colors,
+    main = "Top 25 Significant Differentially Expressed Genes",
+    cluster_cols = FALSE,
+    angle_col = "45",
+    cellheight = 13,
+    fontsize_row = 15,
+    gaps_col = 3,
+    border_color = NA
+  ) 
+}
+```
+
+## Create membrane protein subset
+```{r}
+primedMSC_membrane <- primedMSC[grepl("membrane", primedMSC$GOComponent, ignore.case = TRUE), ]
+
+generate_volcano_plot(primedMSC_membrane, "Volcano plot with membrane proteins")
+
+# Export significant membrane genes
+significant_membrane_genes <- primedMSC_membrane %>%
+  filter(Significant == "Significant") %>%
+  pull(Symbol) %>%
+  unique()
+
+write.table(significant_membrane_genes, file = "significant_membrane_genes.txt", 
+            quote = FALSE, row.names = FALSE, col.names = FALSE)
+```
+
+## Filter membrane subset for functional categories
+```{r}
+# Define GO terms for each functional category
+create_functional_subset <- function(data, process_terms, function_terms, name) {
+  proc_pattern <- paste(process_terms, collapse = "|")
+  fun_pattern <- paste(function_terms, collapse = "|")
+  
+  subset_data <- data[
+    grepl(proc_pattern, data$GOProcessID, ignore.case = TRUE) |
+    grepl(fun_pattern, data$GOFunctionID, ignore.case = TRUE),
+  ]
+  
+  cat(name, "genes:", nrow(subset_data), "\n")
+  return(subset_data)
+}
+
+# 1. Lipid processing
+lipid_process_go <- c("GO:0006629", "GO:0016042", "GO:0008610", "GO:0006869", "GO:0019216")
+lipid_function_go <- c("GO:0008289", "GO:0016298", "GO:0004620")
+primedMSC_membraneLipid <- create_functional_subset(primedMSC_membrane, lipid_process_go, lipid_function_go, "Membrane lipid")
+primedMSC_Lipid <- create_functional_subset(primedMSC, lipid_process_go, lipid_function_go, "All lipid")
+
+# 2. Anti-apoptotic
+anti_process_go <- c("GO:0043066", "GO:0043069")
+anti_function_go <- c("GO:0030234", "GO:0004867")
+primedMSC_antiApoptotic <- create_functional_subset(primedMSC_membrane, anti_process_go, anti_function_go, "Anti-apoptotic")
+
+# 3. Angiogenesis
+angiogenesis_process_go <- c("GO:0001525", "GO:0045766", "GO:0048514", "GO:0001944")
+angiogenesis_function_go <- c("GO:0030545", "GO:0008083", "GO:0005006")
+primedMSC_angiogenesis <- create_functional_subset(primedMSC_membrane, angiogenesis_process_go, angiogenesis_function_go, "Angiogenesis")
+
+# 4. Immunomodulatory
+immuno_process_go <- c("GO:0002376", "GO:0002682", "GO:0050778", "GO:0050776")
+immuno_function_go <- c("GO:0005125", "GO:0008009", "GO:0004896", "GO:0042379")
+primedMSC_immunomodulatory <- create_functional_subset(primedMSC_membrane, immuno_process_go, immuno_function_go, "Immunomodulatory")
+
+# 5. Cell migration/movement
+migration_process_go <- c("GO:0016477", "GO:0030335", "GO:0050900", "GO:0035889", "GO:0007155", "GO:0022409")
+migration_function_go <- c("GO:0050839", "GO:0005178", "GO:0038028", "GO:0030599", "GO:0004950", "GO:0042379")
+primedMSC_cellMovement <- create_functional_subset(primedMSC_membrane, migration_process_go, migration_function_go, "Cell movement")
+```
+
+## Visualization of functional subsets
+```{r}
+# Generate volcano plots for each subset
+generate_volcano_plot(primedMSC_membraneLipid, "Membrane Lipid Processing Genes")
+generate_volcano_plot(primedMSC_Lipid, "All Lipid Processing Genes")
+generate_volcano_plot(primedMSC_antiApoptotic, "Membrane Anti-apoptotic Genes")
+generate_volcano_plot(primedMSC_angiogenesis, "Membrane Angiogenesis Genes")
+generate_volcano_plot(primedMSC_immunomodulatory, "Membrane Immunomodulatory Genes")
+generate_volcano_plot(primedMSC_cellMovement, "Membrane Cell Motility Genes")
+
+# Function to create heatmaps for functional subsets
+create_subset_heatmap <- function(subset_data, subset_name) {
+  # Get significant genes
+  sig_genes <- subset_data %>%
+    filter(Significant == "Significant", !is.na(Symbol)) %>%
+    pull(EnsemblGeneID)
+  
+  if(length(sig_genes) < 2) {
+    message("Not enough significant genes for heatmap: ", subset_name)
+    return(NULL)
+  }
+  
+  # Extract expression data
+  subset_expr <- log2expr[rownames(log2expr) %in% sig_genes, ]
+  
+  # Add gene symbols as rownames
+  gene_mapping <- setNames(subset_data$Symbol, subset_data$EnsemblGeneID)
+  rownames(subset_expr) <- gene_mapping[rownames(subset_expr)]
+  
+  # Remove any remaining NA rownames
+  subset_expr <- subset_expr[!is.na(rownames(subset_expr)), ]
+  
+  if(nrow(subset_expr) > 1) {
+    pheatmap(
+      subset_expr,
+      scale = "row",
+      annotation_col = annotation_col,
+      annotation_colors = ann_colors,
+      cluster_cols = FALSE,
+      angle_col = "45",
+      cellheight = 9,
+      main = paste("Significant Genes:", subset_name),
+      fontsize_row = 8,
+      border_color = NA
+    )
+  }
+}
+
+# Generate heatmaps for each functional subset
+deg_sets <- list(
+  "Membrane Lipid" = primedMSC_membraneLipid,
+  "Anti-Apoptotic" = primedMSC_antiApoptotic,
+  "Angiogenesis" = primedMSC_angiogenesis,
+  "Immunomodulatory" = primedMSC_immunomodulatory,
+  "Cell Migration" = primedMSC_cellMovement
+)
+
+for(set_name in names(deg_sets)) {
+  create_subset_heatmap(deg_sets[[set_name]], set_name)
+}
+```
+
+## Venn diagram of functional overlaps
+```{r}
+# Prepare gene lists for Venn diagram
+venn_list <- list(
+  Lipid = primedMSC_membraneLipid$Symbol,
+  Angio = primedMSC_angiogenesis$Symbol,
+  Apop = primedMSC_antiApoptotic$Symbol,
+  Immune = primedMSC_immunomodulatory$Symbol
+)
+
+# Create Venn diagram
+ggVennDiagram(
+  venn_list,
+  label_alpha = 0,
+  category.names = names(venn_list)
+) +
+  scale_fill_gradient(low = "#FDE725FF", high = "#440154FF") +
+  theme(legend.position = "right", plot.title = element_text(hjust = 0.5)) +
+  ggtitle("Functional Gene Set Overlaps")
+```
+
+## Dot plots of significant genes by functional category
+```{r}
+# Function to create dot plots
+create_dotplot <- function(gene_set, name) {
+  df <- gene_set %>%
+    filter(Significant == "Significant", !is.na(Symbol)) %>%
+    dplyr::select(Symbol, logFC, P.Value) %>%
+    mutate(logP = -log10(P.Value)) %>%
+    arrange(desc(logFC)) %>%
+    #slice_head(n = 20) %>%  # Show top 20 genes
+    mutate(Symbol = factor(Symbol, levels = rev(unique(Symbol))))
+  
+  if(nrow(df) == 0) return(NULL)
+  
+  ggplot(df, aes(x = logFC, y = Symbol)) +
+    geom_point(aes(size = logP, color = logFC)) +
+    scale_color_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+    scale_size(range = c(2, 6)) +
+    theme_minimal() +
+    labs(title = paste("Top Significant Genes:", name),
+         x = "log2 Fold Change",
+         y = "Gene",
+         color = "log2FC",
+         size = "-log10(P-value)")
+}
+
+# Generate dot plots for each functional category
+for(set_name in names(deg_sets)) {
+  p <- create_dotplot(deg_sets[[set_name]], set_name)
+  if(!is.null(p)) {
+    print(p)
+    ggsave(paste0("dotplot_", gsub(" ", "_", set_name), ".png"), 
+           plot = p, width = 10, height = 8)
+  }
+}
+```
+
+## GSEA analysis
+```{r}
+# Prepare ranked gene list for GSEA
+ranks <- primedMSC %>% 
+  arrange(desc(logFC)) %>% 
+  distinct(Symbol, .keep_all = TRUE) %>% 
+  filter(!is.na(Symbol), !is.na(logFC)) %>% 
+  dplyr::select(Symbol, logFC) %>% 
+  deframe()
+
+# Load GO biological process terms
+go_bp <- msigdbr(species = "Homo sapiens", collection = "C5", subcollection = "GO:BP")
+go_list <- split(go_bp$gene_symbol, go_bp$gs_name)
+
+# Run fgsea
+fgseaRes <- fgseaMultilevel(pathways = go_list, stats = ranks)
+
+# Visualize selected GO terms
+go_terms_of_interest <- c("GOBP_IMMUNE_RESPONSE", "GOBP_CELL_MOTILITY", "GOBP_ANGIOGENESIS")
+
+for(term in go_terms_of_interest) {
+  if(term %in% fgseaRes$pathway) {
+    selected_pathway <- fgseaRes %>% filter(pathway == term)
+    leading_edge_genes <- selected_pathway$leadingEdge[[1]]
+    
+    # Create volcano plot highlighting leading edge genes
+    primedMSC_plot <- primedMSC %>%
+      mutate(LeadingEdge = ifelse(Symbol %in% leading_edge_genes, "Leading Edge", "Other"))
+    
+    volcano <- ggplot(primedMSC_plot, aes(x = logFC, y = -log10(P.Value), color = LeadingEdge)) +
+      geom_point(alpha = 0.6) +
+      scale_color_manual(values = c("Other" = "grey", "Leading Edge" = "red")) +
+      theme_minimal() +
+      labs(title = paste("Leading Edge Genes -", gsub("GOBP_", "", term)),
+           x = "Log2 Fold Change",
+           y = "-Log10 P-value") +
+      geom_text_repel(data = primedMSC_plot %>% filter(LeadingEdge == "Leading Edge"),
+                      aes(label = Symbol), size = 3, max.overlaps = 10)
+    
+    print(volcano)
+  }
+}
+```
+
+## GO enrichment analysis of functional subsets
+```{r}
+# Function to perform GO enrichment
+enrich_go_terms <- function(df, set_name) {
+  # Filter for significant genes
+  sig_genes <- df %>% 
+    filter(Significant == "Significant", !is.na(Symbol)) %>% 
+    pull(Symbol) %>% 
+    unique()
+  
+  if(length(sig_genes) < 3) return(NULL)
+  
+  # Convert to ENTREZ IDs
+  sig_gene_ids <- bitr(sig_genes, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+  
+  if(nrow(sig_gene_ids) < 3) return(NULL)
+  
+  # Background genes
+  background_genes <- na.omit(unique(primedMSC$Symbol))
+  universe_ids <- bitr(background_genes, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+  
+  # Run enrichment
+  enrich_res <- enrichGO(
+    gene = sig_gene_ids$ENTREZID,
+    universe = universe_ids$ENTREZID,
+    OrgDb = org.Hs.eg.db,
+    keyType = "ENTREZID",
+    ont = "BP",
+    pAdjustMethod = "BH",
+    pvalueCutoff = 0.05,
+    readable = TRUE
+  )
+  
+  return(simplify(enrich_res))
+}
+
+# Run GO enrichment for each functional subset
+for(set_name in names(deg_sets)) {
+  message("Running GO enrichment for: ", set_name)
+  enrich_res <- enrich_go_terms(deg_sets[[set_name]], set_name)
+  
+  if(!is.null(enrich_res) && nrow(enrich_res) > 0) {
+    print(dotplot(enrich_res, showCategory = 10) + 
+          ggtitle(paste("GO BP Enrichment -", set_name)))
+  } else {
+    message("No significant GO terms found for ", set_name)
+  }
+}
+```
+
+## GSEA of entire dataset
+```{r}
+# Create ranking metric and convert to ENTREZ IDs
+primedMSC_gsea <- primedMSC %>%
+  mutate(rank_metric = -log10(P.Value) * sign(logFC)) %>%
+  filter(!is.na(Symbol), !is.na(rank_metric))
+
+# Build ranking vector
+ranked_genes <- primedMSC_gsea$rank_metric
+names(ranked_genes) <- primedMSC_gsea$Symbol
+
+# Convert to ENTREZ IDs
+gene_df <- bitr(names(ranked_genes), fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+ranked_genes <- ranked_genes[gene_df$SYMBOL]
+names(ranked_genes) <- gene_df$ENTREZID
+
+# Sort and remove duplicates
+ranked_genes <- sort(ranked_genes, decreasing = TRUE)
+ranked_genes <- ranked_genes[!duplicated(names(ranked_genes))]
+
+# Run GSEA
+gsea_res <- gseGO(
+  geneList = ranked_genes,
+  OrgDb = org.Hs.eg.db,
+  keyType = "ENTREZID",
+  ont = "BP",
+  minGSSize = 15,
+  maxGSSize = 500,
+  pvalueCutoff = 0.05,
+  verbose = FALSE
+)
+
+# Visualize results
+if(!is.null(gsea_res) && nrow(gsea_res) > 0) {
+  print(dotplot(gsea_res, showCategory = 15) + 
+        ggtitle("GSEA - Biological Processes in Primed MSCs"))
+} else {
+  message("No significant pathways found in GSEA.")
+}
+```
+## Import microarray data from individual cytokine primed samples (GSE129165)
+```{r}
+expr_raw <- read.delim("G:/.shortcut-targets-by-id/1zOmt4AIZS3E83t7j4JmomdNejC7JYakS/Lucas-research data/01 DATA/Bioinformatics/GSE129165_series.txt", header = TRUE)
+rownames(expr_raw) <- expr_raw$ID_REF
+expr_raw$ID_REF <- NULL
+#Rename column names based on metadata
+new_names <- c(
+  "UC_MSC_resting_rep3", "UC_MSC_TNFa_rep3", "UC_MSC_IL1b_rep3", "UC_MSC_IFNg_rep3",
+  "BM_MSC_resting_rep1", "BM_MSC_TNFa_rep1", "BM_MSC_IL1b_rep1", "BM_MSC_IFNg_rep1",
+  "UC_MSC_resting_rep1", "UC_MSC_TNFa_rep1", "UC_MSC_IL1b_rep1", "UC_MSC_IFNg_rep1",
+  "BM_MSC_resting_rep3", "BM_MSC_TNFa_rep3", "BM_MSC_IL1b_rep3", "BM_MSC_IFNg_rep3",
+  "BM_MSC_resting_rep2", "BM_MSC_TNFa_rep2", "BM_MSC_IL1b_rep2", "BM_MSC_IFNg_rep2",
+  "UC_MSC_resting_rep2", "UC_MSC_TNFa_rep2", "UC_MSC_IL1b_rep2", "UC_MSC_IFNg_rep2"
+)
+
+colnames(expr_raw) <- new_names
+#Filter to get only UC samples
+uc_samples <- grep("UC_MSC", colnames(expr_raw), value = TRUE)
+expr_uc <- expr_raw[, uc_samples]
+
+#Define groups
+condition <- factor(gsub(".*_(resting|TNFa|IL1b|IFNg)_rep[123]", "\\1", uc_samples))
+design <- model.matrix(~ 0 + condition)
+colnames(design) <- levels(condition)
+
+fit <- lmFit(expr_uc, design)
+contrast_matrix <- makeContrasts(
+  TNFa_vs_resting = TNFa - resting,
+  IL1b_vs_resting = IL1b - resting,
+  IFNg_vs_resting = IFNg - resting,
+  levels = design
+)
+fit2 <- contrasts.fit(fit, contrast_matrix)
+fit2 <- eBayes(fit2)
+
+annotate_DE_results <- function(de_results, annotation_db, keytype = "PROBEID") {
+  probe_ids <- rownames(de_results)
+  annot_df <- AnnotationDbi::select(annotation_db,
+                     keys = probe_ids,
+                     columns = c("SYMBOL", "GENENAME", "ENTREZID"),
+                     keytype = keytype)
+  de_results$PROBEID <- rownames(de_results)
+  annotated <- merge(de_results, annot_df, by = "PROBEID", all.x = TRUE)
+    annotated$Significant <- ifelse(
+    !is.na(annotated$adj.P.Val) & !is.na(annotated$logFC) &
+    annotated$adj.P.Val < sig.P.Value & abs(annotated$logFC) > sig.logFC,
+    "Significant", "Not Significant"
+  )
+  # reorder columns to show annotations first
+  annotated <- annotated[, c("PROBEID", "SYMBOL", "GENENAME", "ENTREZID", setdiff(colnames(annotated), c("PROBEID", "SYMBOL", "GENENAME", "ENTREZID")))]
+  return(annotated)
+}
+
+TNFa_results <- topTable(fit2, coef = "TNFa_vs_resting", number = Inf, adjust.method = "BH")
+IL1b_results <- topTable(fit2, coef = "IL1b_vs_resting", number = Inf, adjust.method = "BH")
+IFNg_results <- topTable(fit2, coef = "IFNg_vs_resting", number = Inf, adjust.method = "BH")
+
+# Use it on your results
+TNFa_annotated <- annotate_DE_results(TNFa_results, hgu133plus2.db)
+IL1b_annotated <- annotate_DE_results(IL1b_results, hgu133plus2.db)
+IFNg_annotated <- annotate_DE_results(IFNg_results, hgu133plus2.db)
+
+
+```
+## Venn diagram comparing priming mix and individual cytokines
+```{r}
+# Extract SYMBOLs of significant genes from each annotated DE result
+sig_TNFa <- unique(TNFa_annotated$SYMBOL[TNFa_annotated$Significant == "Significant" & !is.na(TNFa_annotated$SYMBOL)])
+sig_IL1b <- unique(IL1b_annotated$SYMBOL[IL1b_annotated$Significant == "Significant" & !is.na(IL1b_annotated$SYMBOL)])
+sig_IFNg <- unique(IFNg_annotated$SYMBOL[IFNg_annotated$Significant == "Significant" & !is.na(IFNg_annotated$SYMBOL)])
+
+# Extract significant genes from primedMSC (assumed to have SYMBOL and Significant columns)
+sig_primedMSC <- unique(primedMSC$Symbol[primedMSC$Significant == "Significant" & !is.na(primedMSC$Symbol)])
+
+venn_list <- list(
+  TNF-α = sig_TNFa,
+  "IL-1β" = sig_IL1b,
+  IFN-γ = sig_IFNg,
+  Mix = sig_primedMSC
+)
+
+# Create Venn diagram
+ggVennDiagram(
+  venn_list,
+  label_alpha = 0,
+  category.names = names(venn_list)
+) +
+  scale_fill_gradient(low = "#FDE725FF", high = "#440154FF") +
+  theme(legend.position = "right", plot.title = element_text(hjust = 0.5)) +
+  ggtitle("Functional Gene Set Overlaps")
+
+```
+
+```{r}
+TNFa_plus_Mix <- intersect(sig_TNFa, sig_primedMSC)
+IFNg_plus_Mix <- intersect(sig_IFNg, sig_primedMSC)
+TNFa_not_Mix <- setdiff(sig_TNFa, sig_primedMSC)
+IFNg_not_Mix <- setdiff(sig_IFNg, sig_primedMSC)
+
+cat("Gene set sizes:\n")
+cat("TNFa + Mix:", length(TNFa_plus_Mix), "\n")
+cat("IFNg + Mix:", length(IFNg_plus_Mix), "\n")
+cat("TNFa not in Mix:", length(TNFa_not_Mix), "\n")
+cat("IFNg not in Mix:", length(IFNg_not_Mix), "\n")
+
+# Function to filter genes by functional categories using primedMSC annotation
+filter_functional_genes <- function(gene_list, category_name) {
+  
+  # Get the annotated data for genes in our list
+  genes_data <- primedMSC %>%
+    filter(Symbol %in% gene_list, !is.na(Symbol))
+  
+  # Apply the same GO term filters as before
+  if (category_name == "Lipid") {
+    lipid_process_go <- c("GO:0006629", "GO:0016042", "GO:0008610", "GO:0006869", "GO:0019216")
+    lipid_function_go <- c("GO:0008289", "GO:0016298", "GO:0004620")
+    proc_pattern <- paste(lipid_process_go, collapse = "|")
+    fun_pattern <- paste(lipid_function_go, collapse = "|")
+    
+    filtered_genes <- genes_data[
+      grepl(proc_pattern, genes_data$GOProcessID, ignore.case = TRUE) |
+      grepl(fun_pattern, genes_data$GOFunctionID, ignore.case = TRUE),
+    ]
+    
+  } else if (category_name == "Membrane") {
+    filtered_genes <- genes_data[grepl("membrane", genes_data$GOComponent, ignore.case = TRUE), ]
+    
+  } else if (category_name == "AntiApoptotic") {
+    anti_process_go <- c("GO:0043066", "GO:0043069")
+    anti_function_go <- c("GO:0030234", "GO:0004867")
+    anti_proc_pattern <- paste(anti_process_go, collapse = "|")
+    anti_fun_pattern <- paste(anti_function_go, collapse = "|")
+    
+    filtered_genes <- genes_data[
+      grepl(anti_proc_pattern, genes_data$GOProcessID, ignore.case = TRUE) |
+      grepl(anti_fun_pattern, genes_data$GOFunctionID, ignore.case = TRUE),
+    ]
+    
+  } else if (category_name == "Angiogenesis") {
+    angiogenesis_process_go <- c("GO:0001525", "GO:0045766", "GO:0048514", "GO:0001944")
+    angiogenesis_function_go <- c("GO:0030545", "GO:0008083", "GO:0005006")
+    angio_proc_pattern <- paste(angiogenesis_process_go, collapse = "|")
+    angio_fun_pattern <- paste(angiogenesis_function_go, collapse = "|")
+    
+    filtered_genes <- genes_data[
+      grepl(angio_proc_pattern, genes_data$GOProcessID, ignore.case = TRUE) |
+      grepl(angio_fun_pattern, genes_data$GOFunctionID, ignore.case = TRUE),
+    ]
+    
+  } else if (category_name == "Immunomodulatory") {
+    immuno_process_go <- c("GO:0002376", "GO:0002682", "GO:0050778", "GO:0050776")
+    immuno_function_go <- c("GO:0005125", "GO:0008009", "GO:0004896", "GO:0042379")
+    immuno_proc_pattern <- paste(immuno_process_go, collapse = "|")
+    immuno_fun_pattern <- paste(immuno_function_go, collapse = "|")
+    
+    filtered_genes <- genes_data[
+      grepl(immuno_proc_pattern, genes_data$GOProcessID, ignore.case = TRUE) |
+      grepl(immuno_fun_pattern, genes_data$GOFunctionID, ignore.case = TRUE),
+    ]
+    
+  } else if (category_name == "CellMovement") {
+    migration_process_go <- c("GO:0016477", "GO:0030335", "GO:0050900", "GO:0035889", "GO:0007155", "GO:0022409")
+    migration_function_go <- c("GO:0050839", "GO:0005178", "GO:0038028", "GO:0030599", "GO:0004950", "GO:0042379")
+    proc_pattern <- paste(migration_process_go, collapse = "|")
+    fun_pattern <- paste(migration_function_go, collapse = "|")
+    
+    filtered_genes <- genes_data[
+      grepl(proc_pattern, genes_data$GOProcessID, ignore.case = TRUE) |
+      grepl(fun_pattern, genes_data$GOFunctionID, ignore.case = TRUE),
+    ]
+  }
+  
+  return(filtered_genes$Symbol)
+}
+
+# Apply functional filtering to all gene sets
+gene_sets <- list(
+  "TNFa_plus_Mix" = TNFa_plus_Mix,
+  "IFNg_plus_Mix" = IFNg_plus_Mix,
+  "TNFa_not_Mix" = TNFa_not_Mix,
+  "IFNg_not_Mix" = IFNg_not_Mix
+)
+
+functional_categories <- c("Membrane", "Lipid", "AntiApoptotic", "Angiogenesis", "Immunomodulatory", "CellMovement")
+
+# Create results matrix
+results_matrix <- matrix(0, nrow = length(functional_categories), ncol = length(gene_sets))
+rownames(results_matrix) <- functional_categories
+colnames(results_matrix) <- names(gene_sets)
+
+# Store detailed results
+detailed_results <- list()
+
+for (set_name in names(gene_sets)) {
+  detailed_results[[set_name]] <- list()
+  
+  for (category in functional_categories) {
+    filtered_genes <- filter_functional_genes(gene_sets[[set_name]], category)
+    results_matrix[category, set_name] <- length(filtered_genes)
+    detailed_results[[set_name]][[category]] <- filtered_genes
+    
+    cat(set_name, "-", category, ":", length(filtered_genes), "genes\n")
+  }
+}
+
+# Create a heatmap of functional category counts
+library(pheatmap)
+pheatmap(
+  results_matrix,
+  display_numbers = TRUE,
+  number_color = "white",
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  main = "Functional Gene Categories Across Cytokine Conditions",
+  color = colorRampPalette(c("white", "blue"))(50),
+  fontsize_number = 12
+)
+
+# Create a comparison barplot
+library(reshape2)
+results_df <- melt(results_matrix)
+colnames(results_df) <- c("Category", "Condition", "Count")
+
+ggplot(results_df, aes(x = Category, y = Count, fill = Condition)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Functional Gene Categories by Cytokine Condition",
+       x = "Functional Category",
+       y = "Number of Genes") +
+  scale_fill_brewer(type = "qual", palette = "Set2")
+
+# Print some interesting genes for each category
+print_top_genes <- function(gene_list, category_name, n = 5) {
+  if (length(gene_list) > 0) {
+    cat("\nTop", min(n, length(gene_list)), category_name, "genes:\n")
+    cat(paste(head(gene_list, n), collapse = ", "), "\n")
+  }
+}
+
+# Show some examples
+for (set_name in names(gene_sets)) {
+  cat("\n=== ", set_name, " ===\n")
+  for (category in functional_categories) {
+    if (length(detailed_results[[set_name]][[category]]) > 0) {
+      print_top_genes(detailed_results[[set_name]][[category]], category, 3)
+    }
+  }
+}
+```
+
+## Create volcano plots highlighting functional categories for cytokine-specific genes
+```{r}
+# Function to create volcano plots with functional highlighting
+create_functional_volcano <- function(data, gene_set, title_suffix) {
+  # Filter data to genes in our set
+  plot_data <- data %>%
+    filter(Symbol %in% gene_set, !is.na(Symbol), !is.na(logFC), !is.na(P.Value))
+  
+  if (nrow(plot_data) == 0) {
+    message("No data available for ", title_suffix)
+    return(NULL)
+  }
+  
+  # Add functional categories
+  plot_data$Functional_Category <- "Other"
+  
+  for (category in functional_categories) {
+    category_genes <- filter_functional_genes(gene_set, category)
+    plot_data$Functional_Category[plot_data$Symbol %in% category_genes] <- category
+  }
+  
+  # Create volcano plot
+  ggplot(plot_data, aes(x = logFC, y = -log10(P.Value), color = Functional_Category)) +
+    geom_point(alpha = 0.7, size = 2) +
+    scale_color_manual(values = c(
+      "Membrane" = "#E31A1C",
+      "Lipid" = "#FF7F00", 
+      "AntiApoptotic" = "#1F78B4",
+      "Angiogenesis" = "#33A02C",
+      "Immunomodulatory" = "#6A3D9A",
+      "CellMovement" = "#FB9A99",
+      "Other" = "grey"
+    )) +
+    theme_minimal() +
+    labs(title = paste("Functional Categories -", title_suffix),
+         x = "Log2 Fold Change",
+         y = "-Log10 P-value",
+         color = "Function") +
+    geom_text_repel(
+      data = plot_data %>% filter(Functional_Category != "Other"),
+      aes(label = Symbol),
+      size = 3,
+      max.overlaps = 15
+    )
+}
+
+# Create volcano plots for cytokine-specific genes (not in mix)
+if (length(TNFa_not_Mix) > 0) {
+  p1 <- create_functional_volcano(primedMSC, TNFa_not_Mix, "TNFα-specific (not in Mix)")
+  if (!is.null(p1)) print(p1)
+}
+
+if (length(IFNg_not_Mix) > 0) {
+  p2 <- create_functional_volcano(primedMSC, IFNg_not_Mix, "IFN-γ-specific (not in Mix)")
+  if (!is.null(p2)) print(p2)
+}
+```
+
+## Summary table of functional enrichment
+```{r}
+# Create a summary table showing percentages
+percentage_matrix <- results_matrix
+for (i in 1:ncol(results_matrix)) {
+  total_genes <- length(gene_sets[[i]])
+  if (total_genes > 0) {
+    percentage_matrix[, i] <- round((results_matrix[, i] / total_genes) * 100, 1)
+  }
+}
+
+cat("\nPercentage of genes in each functional category:\n")
+print(percentage_matrix)
+
+# Save detailed results
+write.csv(results_matrix, "functional_category_counts.csv")
+write.csv(percentage_matrix, "functional_category_percentages.csv")
+```
+## Transcriptional consistency & synergy
+```{r}
+# Step 1: Subset significant genes and ensure SYMBOL column is not NA
+sig_genes_TNFa <- subset(TNFa_annotated, Significant == "Significant" & !is.na(SYMBOL))
+sig_genes_IFNg <- subset(IFNg_annotated, Significant == "Significant" & !is.na(SYMBOL))
+sig_genes_mix <- subset(primedMSC, Significant == "Significant" & !is.na(Symbol))
+
+colnames(sig_genes_TNFa)[colnames(sig_genes_TNFa) == "SYMBOL"] <- "Symbol"
+colnames(sig_genes_IFNg)[colnames(sig_genes_IFNg) == "SYMBOL"] <- "Symbol"
+# Step 2: Merge by Symbol (gene symbol)
+get_logfc_df_symbol <- function(df, label) {
+  df[, c("Symbol", "logFC")] |>
+    setNames(c("Symbol", paste0("logFC_", label)))
+}
+
+logfc_TNFa <- get_logfc_df_symbol(sig_genes_TNFa, "TNFa")
+logfc_IFNg <- get_logfc_df_symbol(sig_genes_IFNg, "IFNg")
+logfc_mix <- get_logfc_df_symbol(sig_genes_mix, "Mix")
+
+# Step 3: Merge all by "Symbol"
+logfc_merged <- Reduce(function(x, y) merge(x, y, by = "Symbol"), 
+                       list(logfc_TNFa, logfc_IFNg, logfc_mix))
+
+# Step 4: Compute average individual logFC
+logfc_merged$logFC_mean_individual <- rowMeans(logfc_merged[, c("logFC_TNFa", "logFC_IFNg")])
+
+# Step 5: Plot logFC of Mix vs average of TNFa/IFNg
+library(ggplot2)
+ggplot(logfc_merged, aes(x = logFC_mean_individual, y = logFC_Mix)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
+  labs(
+    title = "Synergy vs Additivity in Mixed Priming (SYMBOL-based)",
+    x = "Mean logFC of TNFa and IFNg",
+    y = "logFC of Mixed Priming"
+  ) +
+  theme_minimal()
+
+# Step 6: Correlation test
+cor_result <- cor.test(logfc_merged$logFC_mean_individual, logfc_merged$logFC_Mix)
+print(cor_result)
+
+```
+
+## PCA and hierarchical clustering of PCA samples
+```{r}
+
+
+```
+
